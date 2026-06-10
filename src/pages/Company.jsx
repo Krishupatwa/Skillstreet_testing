@@ -226,7 +226,7 @@ export default function Company({ user }) {
       // Download from deployed backend (Railway) if configured.
       // Vite same-origin proxy can fail in production because the API may live on a different host.
       // Force Railway backend download endpoint.
-      const base = 'https://web-production-906ef.up.railway.app';
+      const base = import.meta.env.VITE_API_URL || 'https://web-production-906ef.up.railway.app';
       const response = await fetch(`${base}/api/files/download/${fileId}`);
       if (!response.ok) {
         const errorText = await response.text();
