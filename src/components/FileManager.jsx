@@ -4,7 +4,6 @@ import { useAuth } from '../hooks/useAuth';
 // If VITE_API_URL isn't set (common in production), fall back to Railway backend.
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://web-production-906ef.up.railway.app';
 
-
 export default function FileManager({ embedded = false }) {
   const { user } = useAuth();
   const [files, setFiles] = useState([]);
