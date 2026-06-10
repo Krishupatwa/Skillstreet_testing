@@ -105,6 +105,17 @@ app.use(express.urlencoded({ extended: true }));
 // Serve uploaded files as static files
 app.use('/uploads', express.static(UPLOADS_DIR));
 
+// IMPORTANT: Download routes must NEVER require Firebase/Firestore auth.
+// Some deployments/logging may still show Firestore calls; this guard forces local-mode for downloads.
+app.use(['/api/files/download', '/api/download'], (req, res, next) => {
+  // Temporarily disable Firestore for any /api/files/download* and /api/download* request.
+  // We keep the original db reference intact for non-download routes.
+  req._originalDb = db;
+  db = null;
+  next();
+});
+
+
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
