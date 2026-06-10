@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../hooks/useAuth';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+// If VITE_API_URL isn't set (common in production), fall back to Railway backend.
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://web-production-906ef.up.railway.app';
+
 
 export default function FileManager({ embedded = false }) {
   const { user } = useAuth();
