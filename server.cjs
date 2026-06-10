@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
@@ -317,8 +317,10 @@ app.get('/api/download/:fileId', async (req, res) => {
       }
     }
 
+    // Provide fully-qualified download URL (Railway), so frontend doesn't rely on same-origin.
+    const baseUrl = process.env.PUBLIC_BASE_URL || 'https://web-production-906ef.up.railway.app';
     res.json({
-      downloadUrl: `/api/files/download/${fileId}`
+      downloadUrl: `${baseUrl}/api/files/download/${fileId}`
     });
   } catch (error) {
     console.error('Download alias error:', error);
