@@ -241,13 +241,23 @@ app.get('/api/files/download/:fileId', async (req, res) => {
 
     // Prefer local metadata (works with local uploads-metadata.json)
     const allFiles = readLocalMetadata();
-    const fileData = allFiles.find((record) => record.id === fileId);
+    let fileData = allFiles.find((record) => record.id === fileId);
+
+    // Fallback: if local metadata doesn't have it, try Firestore metadata (file is still on disk).
+    // This makes downloads work even if local metadata wasn't persisted correctly on Railway.
+    if (!fileData && db) {
+      const fileDoc = await db.collection('files').doc(fileId).get();
+      if (fileDoc.exists) {
+        fileData = fileDoc.data();
+      }
+    }
 
     if (!fileData) {
       return res.status(404).json({ error: 'File not found' });
     }
 
     const filePath = path.join(UPLOADS_DIR, fileData.savedName);
+
 
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'File not found on disk' });
