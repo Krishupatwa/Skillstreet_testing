@@ -223,8 +223,11 @@ export default function Company({ user }) {
     }
 
     try {
-      // Always download from the same origin so Vite proxy routes to the local backend (server.cjs -> uploads/)
-      const response = await fetch(`/api/files/download/${fileId}`);
+      // Download from deployed backend (Railway) if configured.
+      // Vite same-origin proxy can fail in production because the API may live on a different host.
+      // Force Railway backend download endpoint.
+      const base = 'https://web-production-906ef.up.railway.app';
+      const response = await fetch(`${base}/api/files/download/${fileId}`);
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Download failed (${response.status})${errorText ? `: ${errorText}` : ''}`);
