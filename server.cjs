@@ -312,22 +312,20 @@ app.get('/api/files/view/:fileId', async (req, res) => {
 
 // Download link helper for student/company pages
 app.get('/api/download/:fileId', async (req, res) => {
+  // Download alias endpoint.
+  // Important: must NEVER touch Firebase/Firestore auth in production downloads.
+  // We only validate against local `uploads-metadata.json` and then return
+  // a URL to the local streaming endpoint.
   try {
     const { fileId } = req.params;
-    if (db) {
-      const fileDoc = await db.collection('files').doc(fileId).get();
-      if (!fileDoc.exists) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-    } else {
-      const allFiles = readLocalMetadata();
-      const fileData = allFiles.find((record) => record.id === fileId);
-      if (!fileData) {
-        return res.status(404).json({ error: 'File not found' });
-      }
+
+    const allFiles = readLocalMetadata();
+    const fileData = allFiles.find((record) => record.id === fileId);
+    if (!fileData) {
+      // Still return 404 (and not Firestore lookups that can cause UNAUTHENTICATED).
+      return res.status(404).json({ error: 'File not found' });
     }
 
-    // Provide fully-qualified download URL (Railway), so frontend doesn't rely on same-origin.
     const baseUrl = process.env.PUBLIC_BASE_URL || 'https://web-production-906ef.up.railway.app';
     res.json({
       downloadUrl: `${baseUrl}/api/files/download/${fileId}`
