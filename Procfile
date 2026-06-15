@@ -1,4 +1,3 @@
-# Procfile for Railway deployment
-# Railway reads this to know how to start the app
+# Procfile/start command for Node.js hosting
 
 web: node server.cjs
