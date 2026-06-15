@@ -27,20 +27,38 @@ try {
 
 const app = express();
 
-// Local file storage configuration
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// Hostinger/local file storage configuration.
+// Files are stored directly on the Node.js server disk and served by Express.
+const STORAGE_FOLDERS = ['uploads', 'designs', 'files'];
+const STORAGE_ROOTS = STORAGE_FOLDERS.reduce((roots, folder) => {
+  roots[folder] = path.join(__dirname, folder);
+  return roots;
+}, {});
+const UPLOADS_DIR = STORAGE_ROOTS.uploads;
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
-// Ensure uploads directory exists
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-  console.log('Created uploads directory:', UPLOADS_DIR);
+// Ensure local storage directories exist
+for (const folder of STORAGE_FOLDERS) {
+  if (!fs.existsSync(STORAGE_ROOTS[folder])) {
+    fs.mkdirSync(STORAGE_ROOTS[folder], { recursive: true });
+    console.log('Created storage directory:', STORAGE_ROOTS[folder]);
+  }
 }
+
+const resolveStorageFolder = (folder, fallback = 'files') => {
+  return STORAGE_FOLDERS.includes(folder) ? folder : fallback;
+};
+
+const getMetadataFile = (folder) => {
+  return path.join(STORAGE_ROOTS[folder], `${folder}-metadata.json`);
+};
 
 // Configure multer for local file storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
+    const folder = resolveStorageFolder(req.params.folder || req.body.folder, req.defaultStorageFolder || 'files');
+    req.storageFolder = folder;
+    cb(null, STORAGE_ROOTS[folder]);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
@@ -53,45 +71,57 @@ const upload = multer({
   limits: { fileSize: MAX_FILE_SIZE }
 });
 
-const METADATA_FILE = path.join(UPLOADS_DIR, 'uploads-metadata.json');
-
 const COMMISSION_RATE = 10;
 
-const readLocalMetadata = () => {
+const readLocalMetadata = (folder = 'files') => {
   try {
-    if (fs.existsSync(METADATA_FILE)) {
-      const raw = fs.readFileSync(METADATA_FILE, 'utf8');
+    const metadataFile = getMetadataFile(folder);
+    if (fs.existsSync(metadataFile)) {
+      const raw = fs.readFileSync(metadataFile, 'utf8');
       return JSON.parse(raw || '[]');
     }
   } catch (error) {
-    console.warn('Failed to read local metadata file:', error.message);
+    console.warn(`Failed to read ${folder} metadata file:`, error.message);
   }
   return [];
 };
 
-const writeLocalMetadata = (records) => {
+const writeLocalMetadata = (records, folder = 'files') => {
   try {
-    fs.writeFileSync(METADATA_FILE, JSON.stringify(records, null, 2), 'utf8');
+    fs.writeFileSync(getMetadataFile(folder), JSON.stringify(records, null, 2), 'utf8');
   } catch (error) {
-    console.error('Failed to write local metadata file:', error.message);
+    console.error(`Failed to write ${folder} metadata file:`, error.message);
   }
 };
 
-const persistFileMetadata = async (fileData) => {
-  if (db) {
-    try {
-      const docRef = await db.collection('files').add(fileData);
-      return { id: docRef.id, ...fileData };
-    } catch (error) {
-      console.warn('Firestore write failed, falling back to local metadata:', error.message);
+const readAllLocalMetadata = () => {
+  return STORAGE_FOLDERS.flatMap((folder) => {
+    return readLocalMetadata(folder).map((record) => ({
+      folder,
+      ...record,
+      folder: record.folder || folder
+    }));
+  });
+};
+
+const findLocalFileRecord = (fileId) => {
+  for (const folder of STORAGE_FOLDERS) {
+    const records = readLocalMetadata(folder);
+    const index = records.findIndex((record) => record.id === fileId);
+    if (index !== -1) {
+      return { folder, records, index, fileData: { folder, ...records[index] } };
     }
   }
 
-  const existing = readLocalMetadata();
+  return null;
+};
+
+const persistFileMetadata = async (fileData, folder = 'files') => {
+  const existing = readLocalMetadata(folder);
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const record = { id, ...fileData };
+  const record = { id, folder, ...fileData };
   existing.push(record);
-  writeLocalMetadata(existing);
+  writeLocalMetadata(existing, folder);
   return record;
 };
 
@@ -102,18 +132,177 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve uploaded files as static files
-app.use('/uploads', express.static(UPLOADS_DIR));
+// Serve local storage folders as static files.
+for (const folder of STORAGE_FOLDERS) {
+  app.use(`/${folder}`, express.static(STORAGE_ROOTS[folder]));
+}
 
-// IMPORTANT: Download routes must NEVER require Firebase/Firestore auth.
-// Some deployments/logging may still show Firestore calls; this guard forces local-mode for downloads.
-app.use(['/api/files/download', '/api/download'], (req, res, next) => {
-  // Temporarily disable Firestore for any /api/files/download* and /api/download* request.
-  // We keep the original db reference intact for non-download routes.
-  req._originalDb = db;
-  db = null;
-  next();
+const getPublicBaseUrl = (req) => {
+  if (process.env.PUBLIC_BASE_URL) {
+    return process.env.PUBLIC_BASE_URL.replace(/\/$/, '');
+  }
+
+  return `${req.protocol}://${req.get('host')}`;
+};
+
+const createFileRecordFromUpload = (req, folder) => {
+  return {
+    originalName: req.file.originalname,
+    savedName: req.file.filename,
+    folder,
+    mimeType: req.file.mimetype,
+    size: req.file.size,
+    uploadedBy: req.body.uploadedBy || 'anonymous',
+    description: req.body.description || '',
+    uploadedAt: new Date().toISOString(),
+    fileUrl: `/${folder}/${req.file.filename}`,
+    downloads: 0
+  };
+};
+
+const handleLocalUpload = async (req, res, fallbackFolder = 'files') => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const folder = req.storageFolder || resolveStorageFolder(req.params.folder || req.body.folder, fallbackFolder);
+    const fileData = createFileRecordFromUpload(req, folder);
+    const persisted = await persistFileMetadata(fileData, folder);
+
+    res.json({
+      success: true,
+      id: persisted.id,
+      fileId: persisted.id,
+      bucketId: 'local',
+      storage: 'hostinger-local',
+      downloadUrl: `${getPublicBaseUrl(req)}/api/files/download/${persisted.id}`,
+      ...fileData
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Upload failed', details: error.message });
+  }
+};
+
+const handleUploadError = (fallbackFolder = 'files') => {
+  return (req, res, next) => {
+    req.defaultStorageFolder = fallbackFolder;
+    upload.single('file')(req, res, (error) => {
+      if (!error) {
+        return next();
+      }
+
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: `File size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit` });
+      }
+
+      console.error('Multer upload error:', error);
+      return res.status(400).json({ error: 'Upload failed', details: error.message });
+    });
+  };
+};
+
+const downloadLocalFile = (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const match = findLocalFileRecord(fileId);
+
+    if (!match) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const { folder, records, index, fileData } = match;
+    const filePath = path.join(STORAGE_ROOTS[folder], fileData.savedName);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+
+    records[index] = {
+      ...records[index],
+      downloads: (records[index].downloads || 0) + 1
+    };
+    writeLocalMetadata(records, folder);
+
+    res.download(filePath, fileData.originalName);
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({ error: 'Failed to download file', details: error.message });
+  }
+};
+
+const viewLocalFile = (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const match = findLocalFileRecord(fileId);
+
+    if (!match) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const filePath = path.join(STORAGE_ROOTS[match.folder], match.fileData.savedName);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found on disk' });
+    }
+
+    res.setHeader('Content-Type', match.fileData.mimeType || 'application/octet-stream');
+    fs.createReadStream(filePath).pipe(res);
+  } catch (error) {
+    console.error('View file error:', error);
+    res.status(500).json({ error: 'Failed to view file', details: error.message });
+  }
+};
+
+const deleteLocalFile = (req, res) => {
+  try {
+    const { fileId } = req.params;
+    const match = findLocalFileRecord(fileId);
+
+    if (!match) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const filePath = path.join(STORAGE_ROOTS[match.folder], match.fileData.savedName);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    match.records.splice(match.index, 1);
+    writeLocalMetadata(match.records, match.folder);
+
+    res.json({ success: true, message: 'File deleted successfully' });
+  } catch (error) {
+    console.error('Delete error:', error);
+    res.status(500).json({ error: 'Failed to delete file', details: error.message });
+  }
+};
+
+const listLocalFiles = (folder) => {
+  const files = folder ? readLocalMetadata(folder) : readAllLocalMetadata();
+  return files.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+};
+
+const storageRouter = express.Router({ mergeParams: true });
+
+storageRouter.post('/:folder/upload', handleUploadError(), (req, res) => handleLocalUpload(req, res));
+storageRouter.get('/:folder/list', (req, res) => {
+  const folder = resolveStorageFolder(req.params.folder);
+  const files = listLocalFiles(folder);
+  res.json({ success: true, storage: 'hostinger-local', folder, count: files.length, files });
 });
+
+storageRouter.get('/list', (req, res) => {
+  const files = listLocalFiles();
+  res.json({ success: true, storage: 'hostinger-local', count: files.length, files });
+});
+
+storageRouter.get('/download/:fileId', downloadLocalFile);
+storageRouter.get('/view/:fileId', viewLocalFile);
+storageRouter.delete('/:fileId', deleteLocalFile);
+
+app.use('/api/storage', storageRouter);
 
 
 app.get('/api/health', (req, res) => {
@@ -122,6 +311,8 @@ app.get('/api/health', (req, res) => {
     message: 'Backend is running',
     firebaseConfigured: db !== null,
     fileStorageActive: true,
+    storageMode: 'hostinger-local',
+    storageFolders: STORAGE_FOLDERS,
     timestamp: new Date().toISOString()
   });
 });
@@ -137,6 +328,9 @@ app.get('/', (req, res) => {
       download: 'GET /api/files/download/:fileId',
       view: 'GET /api/files/view/:fileId',
       delete: 'DELETE /api/files/:fileId',
+      storageUpload: 'POST /api/storage/:folder/upload',
+      storageList: 'GET /api/storage/:folder/list',
+      storageDownload: 'GET /api/storage/download/:fileId',
       payments: '/api/payments/*',
       approvals: '/api/approvals/*'
     }
@@ -144,98 +338,17 @@ app.get('/', (req, res) => {
 });
 
 // Upload file (community file manager)
-app.post('/api/files/upload', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const { uploadedBy, description } = req.body;
-    const fileData = {
-      originalName: req.file.originalname,
-      savedName: req.file.filename,
-      mimeType: req.file.mimetype,
-      size: req.file.size,
-      uploadedBy: uploadedBy || 'anonymous',
-      description: description || '',
-      uploadedAt: new Date().toISOString(),
-      fileUrl: `/uploads/${req.file.filename}`,
-      downloads: 0
-    };
-
-    const persisted = await persistFileMetadata(fileData);
-
-    res.json({
-      success: true,
-      id: persisted.id,
-      ...fileData
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed', details: error.message });
-  }
-});
+app.post('/api/files/upload', handleUploadError('files'), (req, res) => handleLocalUpload(req, res, 'files'));
 
 // Upload alias for Student submission modal
 // Student.jsx calls POST /api/upload (with field name: `file`).
-app.post('/api/upload', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const { uploadedBy, description } = req.body;
-    const fileData = {
-      originalName: req.file.originalname,
-      savedName: req.file.filename,
-      mimeType: req.file.mimetype,
-      size: req.file.size,
-      uploadedBy: uploadedBy || 'anonymous',
-      description: description || '',
-      uploadedAt: new Date().toISOString(),
-      fileUrl: `/uploads/${req.file.filename}`,
-      downloads: 0
-    };
-
-    const persisted = await persistFileMetadata(fileData);
-
-    // Keep response shape compatible with Student.jsx expectations
-
-    res.json({
-      success: true,
-      fileId: persisted.id,
-      bucketId: 'local',
-      fileUrl: `/uploads/${req.file.filename}`,
-      ...fileData
-    });
-  } catch (error) {
-    console.error('Student upload error:', error);
-    res.status(500).json({ error: 'Upload failed', details: error.message });
-  }
-});
+app.post('/api/upload', handleUploadError('uploads'), (req, res) => handleLocalUpload(req, res, 'uploads'));
 
 
 // List all files
 app.get('/api/files/list', async (req, res) => {
   try {
-    let files = [];
-
-    if (db) {
-      try {
-        const filesCollection = db.collection('files');
-        const querySnapshot = await filesCollection.get();
-        files = querySnapshot.docs
-          .map((doc) => ({ id: doc.id, ...doc.data() }));
-      } catch (error) {
-        console.warn('Firestore list failed, falling back to local metadata:', error.message);
-        files = readLocalMetadata();
-      }
-    } else {
-      files = readLocalMetadata();
-    }
-
-    files = files.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
-
+    const files = listLocalFiles();
     res.json({ success: true, count: files.length, files });
   } catch (error) {
     console.error('List files error:', error);
@@ -244,77 +357,18 @@ app.get('/api/files/list', async (req, res) => {
 });
 
 // Download file
-// IMPORTANT: Always stream from local `uploads/`.
-// This avoids any Firebase/Google auth issues (e.g. 16 UNAUTHENTICATED) during downloads.
-app.get('/api/files/download/:fileId', async (req, res) => {
-  try {
-    const { fileId } = req.params;
-
-    // Prefer local metadata (works with local uploads-metadata.json)
-    const allFiles = readLocalMetadata();
-    let fileData = allFiles.find((record) => record.id === fileId);
-
-    // Fallback: if local metadata doesn't have it, try Firestore metadata (file is still on disk).
-    // This makes downloads work even if local metadata wasn't persisted correctly on Railway.
-    if (!fileData && db) {
-      const fileDoc = await db.collection('files').doc(fileId).get();
-      if (fileDoc.exists) {
-        fileData = fileDoc.data();
-      }
-    }
-
-    if (!fileData) {
-      return res.status(404).json({ error: 'File not found' });
-    }
-
-    const filePath = path.join(UPLOADS_DIR, fileData.savedName);
-
-
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
-
-    // Best-effort downloads counter (never blocks download)
-    try {
-      if (db) {
-        await db.collection('files').doc(fileId).update({
-          downloads: (fileData.downloads || 0) + 1
-        });
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    res.setHeader('Content-Disposition', `attachment; filename="${fileData.originalName}"`);
-    res.setHeader('Content-Type', fileData.mimeType || 'application/octet-stream');
-
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(res);
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).json({ error: 'Failed to download file', details: error.message });
-  }
-});
+app.get('/api/files/download/:fileId', downloadLocalFile);
 
 // View file metadata
 app.get('/api/files/view/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    if (db) {
-      const fileDoc = await db.collection('files').doc(fileId).get();
-      if (!fileDoc.exists) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-      return res.json({ id: fileDoc.id, ...fileDoc.data() });
-    }
-
-    const allFiles = readLocalMetadata();
-    const fileData = allFiles.find((record) => record.id === fileId);
-    if (!fileData) {
+    const match = findLocalFileRecord(fileId);
+    if (!match) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    res.json(fileData);
+    res.json(match.fileData);
   } catch (error) {
     console.error('View file error:', error);
     res.status(500).json({ error: 'Failed to get file metadata', details: error.message });
@@ -323,23 +377,16 @@ app.get('/api/files/view/:fileId', async (req, res) => {
 
 // Download link helper for student/company pages
 app.get('/api/download/:fileId', async (req, res) => {
-  // Download alias endpoint.
-  // Important: must NEVER touch Firebase/Firestore auth in production downloads.
-  // We only validate against local `uploads-metadata.json` and then return
-  // a URL to the local streaming endpoint.
   try {
     const { fileId } = req.params;
 
-    const allFiles = readLocalMetadata();
-    const fileData = allFiles.find((record) => record.id === fileId);
-    if (!fileData) {
-      // Still return 404 (and not Firestore lookups that can cause UNAUTHENTICATED).
+    const match = findLocalFileRecord(fileId);
+    if (!match) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    const baseUrl = process.env.PUBLIC_BASE_URL || 'https://web-production-906ef.up.railway.app';
     res.json({
-      downloadUrl: `${baseUrl}/api/files/download/${fileId}`
+      downloadUrl: `${getPublicBaseUrl(req)}/api/files/download/${fileId}`
     });
   } catch (error) {
     console.error('Download alias error:', error);
@@ -348,44 +395,7 @@ app.get('/api/download/:fileId', async (req, res) => {
 });
 
 // Delete file
-app.delete('/api/files/:fileId', async (req, res) => {
-  try {
-    const { fileId } = req.params;
-    let fileData = null;
-
-    if (db) {
-      const fileDoc = await db.collection('files').doc(fileId).get();
-      if (!fileDoc.exists) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-      fileData = fileDoc.data();
-    } else {
-      const allFiles = readLocalMetadata();
-      const recordIndex = allFiles.findIndex((record) => record.id === fileId);
-      if (recordIndex === -1) {
-        return res.status(404).json({ error: 'File not found' });
-      }
-      fileData = allFiles[recordIndex];
-      allFiles.splice(recordIndex, 1);
-      writeLocalMetadata(allFiles);
-    }
-
-    const filePath = path.join(UPLOADS_DIR, fileData.savedName);
-
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-
-    if (db) {
-      await db.collection('files').doc(fileId).delete();
-    }
-
-    res.json({ success: true, message: 'File deleted successfully' });
-  } catch (error) {
-    console.error('Delete error:', error);
-    res.status(500).json({ error: 'Failed to delete file', details: error.message });
-  }
-});
+app.delete('/api/files/:fileId', deleteLocalFile);
 
 // Payment API Endpoints
 app.post('/api/payments/create-intent', async (req, res) => {
@@ -551,7 +561,7 @@ app.get('/api/approvals/submission/:submissionId', async (req, res) => {
 const PORT = process.env.PORT || 3001;
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📁 File uploads directory: ${UPLOADS_DIR}`);
+  console.log(`📁 Storage directories: ${STORAGE_FOLDERS.map((folder) => STORAGE_ROOTS[folder]).join(', ')}`);
   console.log(`📊 Max file size: ${MAX_FILE_SIZE / (1024 * 1024)}MB`);
 });
 
