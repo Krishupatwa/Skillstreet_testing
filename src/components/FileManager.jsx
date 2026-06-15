@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../hooks/useAuth';
 
-// If VITE_API_URL isn't set (common in production), fall back to Railway backend.
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://web-production-906ef.up.railway.app';
+// In production on Hostinger, leave VITE_API_URL empty to use same-origin /api routes.
+const API_BASE_URL = import.meta.env.VITE_API_URL
+  ? import.meta.env.VITE_API_URL.replace(/\/$/, '')
+  : '';
 
 export default function FileManager({ embedded = false }) {
   const { user } = useAuth();
